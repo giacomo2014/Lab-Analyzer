@@ -1,0 +1,287 @@
+Main.py
+
+from flask import Flask, request, render_template_string, jsonify
+import re
+import sqlite3
+from datetime import datetime
+import os
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-key-for-lab-analyzer')
+
+# ========== DATABASE SETUP ==========
+def init_db():
+    conn = sqlite3.connect('lab_history.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lab_text TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            language TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def save_analysis(lab_text, results_html, language, mode):
+    conn = sqlite3.connect('lab_history.db')
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO analyses (lab_text, results_json, language, mode, created_at) VALUES (?, ?, ?, ?, ?)',
+        (lab_text, results_html, language, mode, datetime.now())
+    )
+    conn.commit()
+    conn.close()
+
+def get_all_analyses(limit=20):
+    conn = sqlite3.connect('lab_history.db')
+    c = conn.cursor()
+    c.execute('SELECT id, lab_text, results_json, created_at FROM analyses ORDER BY created_at DESC LIMIT ?', (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "lab_text": r[1], "results_json": r[2], "created_at": r[3]} for r in rows]
+
+# ========== REFERENCE RANGES (42 markers) ==========
+REF_RANGES = {
+    'bun': (6, 20, 'mg/dL'),
+    'creatinine': (0.7, 1.3, 'mg/dL'),
+    'egfr': (90, 120, 'mL/min'),
+    'a1c': (4.0, 5.6, '%'),
+    'crp': (0, 0.5, 'mg/dL'),
+    'esr': (0, 20, 'mm/hr'),
+    'b12': (200, 900, 'pg/mL'),
+    'glucose': (70, 99, 'mg/dL'),
+    'potassium': (3.5, 5.1, 'mEq/L'),
+    'sodium': (135, 145, 'mEq/L'),
+    'calcium': (8.6, 10.2, 'mg/dL'),
+    'total_cholesterol': (125, 200, 'mg/dL'),
+    'ldl': (0, 100, 'mg/dL'),
+    'hdl': (40, 60, 'mg/dL'),
+    'triglycerides': (0, 150, 'mg/dL'),
+    'alt': (10, 40, 'U/L'),
+    'ast': (10, 40, 'U/L'),
+    'wbc': (3.4, 10.8, 'x10³/µL'),
+    'rbc': (4.2, 5.8, 'x10⁶/µL'),
+    'hemoglobin': (12.0, 16.0, 'g/dL'),
+    'platelets': (150, 450, 'x10³/µL'),
+    'ferritin': (20, 250, 'ng/mL'),
+    'vitamin_d': (30, 80, 'ng/mL'),
+    'tsh': (0.4, 4.0, 'mIU/L'),
+    'testosterone': (300, 1000, 'ng/dL'),
+    'total_bilirubin': (0.3, 1.2, 'mg/dL'),
+    'albumin': (3.5, 5.0, 'g/dL'),
+    'alp': (30, 120, 'U/L'),
+    'total_protein': (6.0, 8.3, 'g/dL'),
+    'co2': (22, 29, 'mEq/L'),
+    'chloride': (98, 107, 'mEq/L'),
+}
+
+# ========== FOOD ASSOCIATIONS (simplified – full version from previous) ==========
+FOOD_ASSOCIATIONS_DETAILED = {
+    "en": {"title": "🔬 LAB PATTERN ANALYSIS", "disclaimer": "⚠️ NOT MEDICAL ADVICE — Educational only.", "consult": "⚠️ NOT MEDICAL ADVICE — Consult your doctor.", "food_header": "🍎 FOOD & BODY CHEMISTRY", "marker": "Marker", "value": "Value", "normal_range": "Normal Range", "status": "Status", "high": {'bun': 'High protein intake (meat, protein shakes, beans), dehydration', 'a1c': 'High sugar/carb intake: soda, sweets, white bread, rice', 'ldl': 'Saturated/trans fats: fried foods, processed meats, butter', 'potassium': 'Bananas, potatoes, leafy greens, avocados, beans'}, "low": {'bun': 'Low protein intake, overhydration, liver disease', 'b12': 'Vegetarian/vegan diet, low animal products', 'ferritin': 'Low iron intake: red meat, tea/coffee with meals'}},
+    "es": {"title": "🔬 ANÁLISIS DE PATRONES DE LABORATORIO", "disclaimer": "⚠️ NO ES ASESORAMIENTO MÉDICO — Solo educativo.", "consult": "⚠️ NO ES ASESORAMIENTO MÉDICO — Consulte a su médico.", "food_header": "🍎 QUÍMICA DE LOS ALIMENTOS Y EL CUERPO", "marker": "Marcador", "value": "Valor", "normal_range": "Rango Normal", "status": "Estado", "high": {'bun': 'Alta ingesta de proteínas (carne, batidos, frijoles), deshidratación', 'a1c': 'Alta ingesta de azúcar: refrescos, dulces, pan blanco, arroz', 'ldl': 'Grasas saturadas/trans: frituras, carnes procesadas, mantequilla', 'potassium': 'Plátanos, nopales, espinacas, frijoles, aguacate'}, "low": {'bun': 'Baja ingesta de proteínas, sobrehidratación, enfermedad hepática', 'b12': 'Dieta vegetariana/vegana, pocos productos animales'}},
+    "pt": {"title": "🔬 ANÁLISE DE PADRÕES LABORATORIAIS", "disclaimer": "⚠️ NÃO É CONSELHO MÉDICO — Apenas educacional.", "consult": "⚠️ NÃO É CONSELHO MÉDICO — Consulte seu médico.", "food_header": "🍎 QUÍMICA DOS ALIMENTOS E DO CORPO", "marker": "Marcador", "value": "Valor", "normal_range": "Faixa Normal", "status": "Status", "high": {'bun': 'Alta ingestão de proteínas (carne, shakes, feijão), desidratação', 'a1c': 'Alta ingestão de açúcar: refrigerantes, doces, pão branco, arroz', 'ldl': 'Gorduras saturadas/trans: frituras, carnes processadas, manteiga', 'potassium': 'Banana, mandioca, feijão, espinafre, abacate'}, "low": {'bun': 'Baixa ingestão de proteínas, sobreidratação, doença hepática', 'b12': 'Dieta vegetariana/vegana, poucos produtos animais'}},
+    "fr": {"title": "🔬 ANALYSE DES PROFILS DE LABORATOIRE", "disclaimer": "⚠️ PAS UN AVIS MÉDICAL — Éducatif seulement.", "consult": "⚠️ PAS UN AVIS MÉDICAL — Consultez votre médecin.", "food_header": "🍎 CHIMIE ALIMENTAIRE ET CORPORELLE", "marker": "Marqueur", "value": "Valeur", "normal_range": "Plage Normale", "status": "Statut", "high": {'bun': 'Apport élevé en protéines (viande, shakes, haricots), déshydratation', 'a1c': 'Apport élevé en sucre: soda, bonbons, pain blanc, riz blanc', 'ldl': 'Graisses saturées/trans: aliments frits, viandes transformées, beurre', 'potassium': 'Bananes, patates douces, épinards, haricots, avocat'}, "low": {'bun': 'Faible apport en protéines, surhydratation, maladie du foie', 'b12': 'Régime végétarien/végétalien, peu de produits animaux'}},
+    "zh": {"title": "🔬 实验室模式分析", "disclaimer": "⚠️ 非医疗建议 — 仅限教育", "consult": "⚠️ 请咨询医生", "food_header": "🍎 食物与身体化学", "marker": "标记", "value": "数值", "normal_range": "正常范围", "status": "状态", "high": {'bun': '高蛋白摄入（肉类、蛋白粉、豆类），脱水', 'a1c': '高糖/碳水化合物摄入：汽水、糖果、白面包、白米饭', 'ldl': '饱和/反式脂肪：油炸食品、加工肉类、黄油', 'potassium': '香蕉、红薯、小白菜、菠菜、毛豆'}, "low": {'bun': '低蛋白摄入、过度水合、肝病', 'b12': '素食/纯素饮食，动物产品摄入少', 'ferritin': '铁摄入低：红肉少、餐时喝茶/咖啡'}},
+    "tl": {"title": "🔬 PAGSUSURI NG LABORATORYO", "disclaimer": "⚠️ HINDI MEDIKAL NA PAYO — Pang-edukasyon lamang.", "consult": "⚠️ HINDI MEDIKAL NA PAYO — Kumonsulta sa iyong doktor.", "food_header": "🍎 KEMIKAL NG PAGKAIN AT KATAWAN", "marker": "Marker", "value": "Halaga", "normal_range": "Normal na Saklaw", "status": "Katayuan", "high": {'bun': 'Mataas na protina (karne, protein shake, beans), dehydration', 'a1c': 'Mataas na asukal: softdrinks, kendi, puting bigas, puting tinapay', 'ldl': 'Pritong pagkain, matatabang karne, mantikilya', 'potassium': 'Saging, kamote, malunggay, sitaw, abokado'}, "low": {'bun': 'Mababang protina, sobrang tubig, sakit sa atay', 'b12': 'Pagkaing vegetarian/vegan, kaunting produktong hayop'}},
+    "vi": {"title": "🔬 PHÂN TÍCH MẪU XÉT NGHIỆM", "disclaimer": "⚠️ KHÔNG PHẢI LỜI KHUYÊN Y TẾ — Chỉ mang tính giáo dục.", "consult": "⚠️ KHÔNG PHẢI LỜI KHUYÊN Y TẾ — Tham khảo ý kiến bác sĩ.", "food_header": "🍎 HÓA HỌC THỰC PHẨM VÀ CƠ THỂ", "marker": "Chỉ số", "value": "Giá trị", "normal_range": "Khoảng Bình Thường", "status": "Trạng thái", "high": {'bun': 'Protein cao (thịt, đậu nành, bột protein), mất nước', 'a1c': 'Đường cao: nước ngọt, kẹo, cơm trắng, bánh mì trắng', 'ldl': 'Đồ chiên rán, mỡ động vật, bơ', 'potassium': 'Chuối, khoai lang, rau muống, đậu, bơ'}, "low": {'bun': 'Protein thấp, uống quá nhiều nước, bệnh gan', 'b12': 'Chế độ ăn chay, ít sản phẩm động vật'}}
+}
+
+FOOD_ASSOCIATIONS_CONCISE = {
+    "zh": {"title": "🔬 实验室模式分析", "disclaimer": "⚠️ 非医疗建议 — 仅限教育", "consult": "⚠️ 请咨询医生", "food_header": "🍎 食物与身体化学", "marker": "标记", "value": "数值", "normal_range": "正常范围", "status": "状态", "high": {'bun': '高蛋白 → 肉·豆·蛋白粉 · 缺水', 'a1c': '高糖 → 甜饮·糖·白饭·白面包', 'ldl': '高LDL → 油炸·肥肉·黄油', 'potassium': '高钾 → 香蕉·红薯·小白菜·菠菜·毛豆'}, "low": {'bun': '低蛋白 → 少肉·少豆·缺水', 'b12': '低B12 → 素食·少动物食品', 'ferritin': '低铁 → 少红肉·茶/咖啡随餐'}},
+    "es_short": {"title": "🔬 ANÁLISIS DE LABORATORIO", "disclaimer": "⚠️ NO ES CONSEJO MÉDICO — Solo educativo", "consult": "⚠️ Consulte a su médico", "food_header": "🍎 ALIMENTOS Y CUERPO", "marker": "Marcador", "value": "Valor", "normal_range": "Rango", "status": "Estado", "high": {'bun': 'Alta proteína → carne·batidos·frijoles · falta agua', 'a1c': 'Alta azúcar → refrescos·dulces·pan·arroz', 'ldl': 'LDL alto → frituras·grasas animales·mantequilla', 'potassium': 'Potasio alto → plátanos·nopales·espinacas·frijoles·aguacate'}, "low": {'bun': 'Baja proteína → poca carne·poca proteína·agua extra', 'b12': 'B12 bajo → vegetariano/vegano·pocos animales', 'ferritin': 'Hierro bajo → poca carne roja·té/café con comidas'}}
+}
+
+def parse_labs(text):
+    text = text.lower()
+    results = {}
+    for key in REF_RANGES:
+        pattern = rf'{key}\s*(\d+\.?\d*)'
+        match = re.search(pattern, text)
+        if match:
+            value = float(match.group(1))
+            low, high, unit = REF_RANGES[key]
+            status = 'normal'
+            if value < low:
+                status = 'low'
+            elif value > high:
+                status = 'high'
+            results[key] = {'value': value, 'status': status, 'low': low, 'high': high, 'unit': unit}
+    return results
+
+def generate_html_response(results, lang, mode):
+    if mode == 'concise':
+        if lang == 'zh':
+            dict_obj = FOOD_ASSOCIATIONS_CONCISE.get('zh')
+        elif lang == 'es':
+            dict_obj = FOOD_ASSOCIATIONS_CONCISE.get('es_short')
+        else:
+            dict_obj = FOOD_ASSOCIATIONS_DETAILED.get(lang, FOOD_ASSOCIATIONS_DETAILED['en'])
+    else:
+        dict_obj = FOOD_ASSOCIATIONS_DETAILED.get(lang, FOOD_ASSOCIATIONS_DETAILED['en'])
+    
+    if not results:
+        return f"<p>{dict_obj['disclaimer']}<br>No lab values recognized. Try: <code>BUN 32, Cr 1.02, A1c 5.8</code></p>"
+    
+    lines = []
+    lines.append("<div class='analysis'>")
+    lines.append(f"<h2>{dict_obj['title']}</h2>")
+    lines.append(f"<p class='disclaimer'>{dict_obj['disclaimer']}</p>")
+    lines.append("<table style='width:100%; border-collapse:collapse; margin:15px 0;'><tr style='background:#e9ecef;'><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr>".format(dict_obj['marker'], dict_obj['value'], dict_obj['normal_range'], dict_obj['status']))
+    abnormals = {}
+    for key, data in results.items():
+        icon = "✅" if data['status'] == 'normal' else ("🔴" if data['status'] == 'high' else "🔵")
+        status_text = data['status'].upper()
+        lines.append(f"<tr><td>{icon} {key.upper()}</td><td>{data['value']} {data['unit']}</td><td>{data['low']}–{data['high']}</td><td>{status_text}</td></tr>")
+        if data['status'] != 'normal':
+            abnormals[key] = data
+    lines.append("</table>")
+    if abnormals:
+        lines.append(f"<h3>{dict_obj['food_header']}</h3><ul>")
+        for key, data in abnormals.items():
+            status = data['status']
+            if status in dict_obj and key in dict_obj[status]:
+                lines.append(f"<li><strong>{key.upper()}</strong> ({status}): {dict_obj[status][key]}</li>")
+            else:
+                lines.append(f"<li><strong>{key.upper()}</strong> ({status}): description coming soon</li>")
+        lines.append("</ul>")
+    lines.append("<hr><p class='disclaimer'>{}</p></div>".format(dict_obj['consult']))
+    return "\n".join(lines)
+
+def get_marker_description(marker_key, lang, mode):
+    desc = {'bun': 'Kidney function & protein metabolism', 'a1c': 'Average blood sugar (2-3 months)'}
+    return desc.get(marker_key, 'No description')
+
+# ========== HTML TEMPLATES ==========
+MAIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Lab Analyzer</title>
+<style>
+*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;margin:0;padding:20px}
+.container{max-width:1000px;margin:0 auto;background:white;border-radius:20px;padding:30px;box-shadow:0 4px 12px rgba(0,0,0,0.1)}
+h1{color:#1e3c72}textarea{width:100%;padding:12px;font-size:1rem;font-family:monospace;border:2px solid #ddd;border-radius:12px;resize:vertical}
+select,button{background:linear-gradient(135deg,#1e3c72,#2a5298);color:white;border:none;padding:8px 16px;border-radius:30px;cursor:pointer;margin:5px}
+.mode-toggle{background:#ffc107;color:#1e3c72}.footer{text-align:center;font-size:0.8rem;color:#666;margin-top:30px}
+.nav-bar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:20px}
+.nav-links a{margin-left:15px;text-decoration:none;color:#2a5298}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="nav-bar">
+<div><select id="langSelect"><option value="en">English</option><option value="es">Español</option><option value="pt">Português</option><option value="zh">中文</option><option value="fr">Français</option><option value="tl">Tagalog</option><option value="vi">Tiếng Việt</option></select>
+<button id="modeToggle" class="mode-toggle">Switch Mode</button></div>
+<div class="nav-links"><a href="/markers">📋 Marker Library</a><button id="historyBtn">📋 History</button></div>
+</div>
+<h1>🔬 Lab Analyzer</h1>
+<p>Enter your lab values (e.g., BUN 32, A1c 5.8)</p>
+<textarea id="labInput" rows="4" placeholder="Example: BUN 32, Cr 1.02, A1c 5.8"></textarea>
+<button id="analyzeBtn">Analyze</button>
+<div id="results" class="results"></div>
+<div id="historyPanel" style="display:none; margin-top:30px;"><h3>History</h3><div id="historyList"></div></div>
+<div class="footer">Educational only. Not medical advice.</div>
+</div>
+<script>
+let currentLang='en',currentMode='detailed';
+document.getElementById('langSelect').addEventListener('change',function(){currentLang=this.value;});
+document.getElementById('modeToggle').addEventListener('click',function(){currentMode=currentMode==='detailed'?'concise':'detailed';this.textContent=currentMode==='detailed'?'Switch to Concise':'Switch to Detailed';});
+document.getElementById('analyzeBtn').addEventListener('click',async function(){const labText=document.getElementById('labInput').value;const response=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lab_text:labText,language:currentLang,mode:currentMode})});const data=await response.json();document.getElementById('results').innerHTML=data.analysis;});
+document.getElementById('historyBtn').addEventListener('click',async function(){const panel=document.getElementById('historyPanel');if(panel.style.display==='none'){const response=await fetch('/api/history');const data=await response.json();const list=document.getElementById('historyList');list.innerHTML=data.history.map(h=>`<div>${new Date(h.created_at).toLocaleString()} - ${h.lab_text.substring(0,50)}</div>`).join('');panel.style.display='block';}else{panel.style.display='none';}});
+</script>
+</body></html>
+"""
+
+MARKER_LIBRARY_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Marker Library</title><style>
+body{font-family:sans-serif;background:#f0f2f5;padding:20px}.container{max-width:1200px;margin:auto;background:white;border-radius:20px;padding:30px}
+.marker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:15px}.marker-card{background:#f8f9fa;padding:15px;border-radius:12px;cursor:pointer}
+.marker-card:hover{background:#e9ecef}
+</style></head>
+<body><div class="container"><h1>📋 Marker Library</h1><div class="marker-grid">
+{% for marker in markers %}<div class="marker-card" onclick="location.href='/marker/{{ marker.name }}?lang={{ lang }}&mode={{ mode }}'"><strong>{{ marker.name }}</strong><br>{{ marker.normal_low }}–{{ marker.normal_high }} {{ marker.unit }}<br>{{ marker.description }}</div>{% endfor %}
+</div><a href="/">← Back</a></div></body></html>
+"""
+
+# ========== ROUTES ==========
+@app.route('/')
+def index():
+    lang = request.args.get('lang', 'en')
+    mode = request.args.get('mode', 'detailed')
+    return render_template_string(MAIN_HTML, lang=lang, mode=mode)
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    data = request.get_json()
+    lab_text = data.get('lab_text', '').strip()
+    lang = data.get('language', 'en')
+    mode = data.get('mode', 'detailed')
+    if not lab_text:
+        return jsonify({"error": "No text provided"}), 400
+    parsed = parse_labs(lab_text)
+    result_html = generate_html_response(parsed, lang, mode)
+    save_analysis(lab_text, result_html, lang, mode)
+    return jsonify({"analysis": result_html})
+
+@app.route('/api/history')
+def api_history():
+    analyses = get_all_analyses()
+    return jsonify({"history": analyses})
+
+@app.route('/api/history/<int:analysis_id>')
+def api_history_detail(analysis_id):
+    conn = sqlite3.connect('lab_history.db')
+    c = conn.cursor()
+    c.execute('SELECT id, lab_text, results_json, created_at FROM analyses WHERE id = ?', (analysis_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return jsonify({"id": row[0], "lab_text": row[1], "results_json": row[2], "created_at": row[3]})
+    return jsonify({"error": "Not found"}), 404
+
+@app.route('/markers')
+def marker_library():
+    lang = request.args.get('lang', 'en')
+    mode = request.args.get('mode', 'detailed')
+    markers = []
+    for key, (low, high, unit) in REF_RANGES.items():
+        markers.append({'name': key.upper(), 'normal_low': low, 'normal_high': high, 'unit': unit, 'description': get_marker_description(key, lang, mode)})
+    markers.sort(key=lambda x: x['name'])
+    return render_template_string(MARKER_LIBRARY_HTML, markers=markers, lang=lang, mode=mode)
+
+@app.route('/marker/<marker_name>')
+def marker_detail(marker_name):
+    lang = request.args.get('lang', 'en')
+    mode = request.args.get('mode', 'detailed')
+    marker_key = marker_name.lower()
+    if marker_key not in REF_RANGES:
+        return "Marker not found", 404
+    low, high, unit = REF_RANGES[marker_key]
+    if mode == 'concise' and lang == 'zh':
+        dict_obj = FOOD_ASSOCIATIONS_CONCISE.get('zh')
+    elif mode == 'concise' and lang == 'es':
+        dict_obj = FOOD_ASSOCIATIONS_CONCISE.get('es_short')
+    else:
+        dict_obj = FOOD_ASSOCIATIONS_DETAILED.get(lang, FOOD_ASSOCIATIONS_DETAILED['en'])
+    food_high = dict_obj.get('high', {}).get(marker_key, 'Information not available')
+    food_low = dict_obj.get('low', {}).get(marker_key, 'Information not available')
+    return f"""
+    <!DOCTYPE html>
+    <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{marker_name} – Lab Analyzer</title>
+    <style>body{{font-family:sans-serif;background:#f0f2f5;margin:0;padding:20px}}.container{{max-width:800px;margin:0 auto;background:white;border-radius:20px;padding:30px;box-shadow:0 4px 12px rgba(0,0,0,0.1)}}h1{{color:#1e3c72}}.back-link{{display:inline-block;margin-bottom:20px;color:#2a5298;text-decoration:none}}.range-box{{background:#e3f2fd;padding:15px;border-radius:12px;margin:20px 0}}.food-section{{margin:20px 0;padding:15px;background:#f8f9fa;border-radius:12px}}.food-high{{border-left:4px solid #dc3545}}.food-low{{border-left:4px solid #ffc107}}.disclaimer{{background:#fff3cd;padding:12px;border-radius:8px;font-size:0.85rem;color:#856404;margin-top:20px}}</style>
+    </head><body><div class="container"><a href="/markers?lang={lang}&mode={mode}" class="back-link">← Back</a><h1>{marker_name}</h1>
+    <div class="range-box"><strong>Normal Range:</strong> {low}–{high} {unit}</div>
+    <div class="food-section food-high"><h3>🍎 High {marker_name}</h3><p>{food_high}</p></div>
+    <div class="food-section food-low"><h3>🍎 Low {marker_name}</h3><p>{food_low}</p></div>
+    <div class="disclaimer">⚠️ NOT MEDICAL ADVICE — Consult your doctor.</div></div></body></html>
+    """
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
