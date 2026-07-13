@@ -1,6 +1,3 @@
-render.yaml
-
-
 services:
   - type: web
     name: lab-analyzer
@@ -12,4 +9,3 @@ services:
         generateValue: true
       - key: PYTHON_VERSION
         value: 3.11.0
-
