@@ -1,6 +1,0 @@
-Requirements. Txt
-
-flask
-flask-cors
-openai
-requests
