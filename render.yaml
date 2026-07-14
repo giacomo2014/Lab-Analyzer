@@ -2,6 +2,7 @@ services:
   - type: web
     name: lab-analyzer
     env: python
+    # This comment forces a fresh build
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
