@@ -1,5 +1,7 @@
 main.py
-
+# Deployment version 2
+from flask import Flask, request, render_template_string, jsonify
+...
 from flask import Flask, request, render_template_string, jsonify
 import re
 import sqlite3
